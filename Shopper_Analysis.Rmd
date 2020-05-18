@@ -1,0 +1,211 @@
+
+# Supermarket Sales Analysis
+## Initialisation
+```{r}
+s2_prod <- read.csv("s2_product_master.csv")
+s2_trans <- read.csv("s2_transaction_data.csv")
+library(tidyverse)
+library(lubridate)
+library(factoextra)
+library(cluster)
+library(ggfortify)
+
+summary(s2_prod)
+summary(s2_trans)
+
+#Examining the Category Descriptions
+unique(s2_prod$product_lvl1_cat_desc)
+unique(s2_prod$product_lvl2_cat_desc)
+
+#Initial Joining of the two datasets
+joined <- left_join(s2_trans, s2_prod, by = c("sales_product"="product_id")) %>%
+  mutate(sales_date_id = ymd(sales_date_id))
+```
+
+## Dataframe Manipulation
+```{r}
+#Calculating relevant data from the joined table
+
+#Get number of items per receipt for each customer
+item_per_receipt <- joined %>% group_by(sales_customer, sales_receipt) %>% tally(name='itemperreceipt') %>% 
+  ungroup() %>% group_by(sales_customer) %>% mutate(mean = cummean(itemperreceipt)) %>%
+  slice(n()) %>% select(c(1,2,4))
+
+#Count number of visits to the store
+visits <- joined %>% group_by(sales_customer, sales_receipt) %>% slice(n()) %>%
+  ungroup() %>% group_by(sales_customer) %>% tally(name = 'visits')
+
+#Count no. of days passed since last visit
+last_date <- (joined %>% arrange(sales_date_id) %>% slice(n()))$sales_date_id 
+last_ago <- joined %>% group_by(sales_customer) %>% arrange(sales_date_id) %>%
+  slice(n()) %>% mutate(ago = as.numeric(difftime(last_date, sales_date_id, units = "days"))) %>%
+  select(c(2,3,4,9))
+
+#Count no. of purchases of each level 1 category
+cat_count <- joined %>% group_by(sales_customer, product_lvl1_cat_desc) %>% tally(name = "lvl1_count") %>%
+  spread(product_lvl1_cat_desc, lvl1_count, fill = 0)
+
+s2_final <- left_join(joined, item_per_receipt, by = "sales_customer") %>% 
+  select(c(1:5,7,8,10))
+s2_final <- left_join(s2_final, visits, by= "sales_customer")
+s2_final <- left_join(s2_final, last_ago, by= "sales_customer") %>%
+  select(c(1:9, 12))
+s2_final <- left_join(s2_final, cat_count)
+
+#Initial Dataframe for clustering
+bycustomer <- s2_final %>% ungroup() %>%
+  group_by(sales_customer) %>% slice(n()) %>% select(c(3, 8:25))
+```
+
+## Cluster Analysis
+### Initial Attempt with Principal Component Analysis
+```{r}
+pca_data1 <- prcomp(bycustomer[-1], scale. = TRUE, center = TRUE)
+
+#Each attribute contributes relatively little to total variance
+fviz_contrib(pca_data1, "var")
+
+pca_kmeans1 <- kmeans(pca_data1$x, 3)
+
+#Choosing ideal no. of clusters
+wss1 <- numeric(25)
+for(k in 1:25){
+  model1 <- kmeans(pca_data1$x, k, nstart = 25, iter.max = 20)
+  wss1[k] <- sum(model1$withinss)
+}
+#use k=4
+plot(1:25, wss1)
+final_model1 <- kmeans(pca_data1$x, 4)
+fviz_cluster(final_model1, pca_data1$x)
+```
+
+### Further Dataframe Manipulation
+```{r}
+### Clustering at k=2,3,4 does not seem to classify well.
+### Need to provide additional attributes used for clustering with
+### more meaningful comparison.
+ggplot(bycustomer, aes(x=visits, y=DairyAndChilled, size = FoodCommodity)) + 
+  geom_jitter(aes(color = as.factor(final_model1$cluster))) + 
+  theme(legend.position = "bottom") +
+  labs(title="4-Group Clustering",
+       x="No. of Visits", y="No. of Dairy & Chilled Goods Purchased",
+       fill = "Clusterting Groups")
+
+
+#The Level 1 categories can be split into 2 categories
+#1. short_storage
+#2. long_storage
+lst <- unique(s2_prod$product_lvl1_cat_desc)
+short_storage <- lst[c(3,6,7,8,9,14)]
+long_storage <- lst[c(1,2,4,5,10,11,12,13,15)]
+storage_p <- joined %>% mutate(short_storage =
+                               if_else(product_lvl1_cat_desc %in% short_storage,
+                                       1, 0)) %>%
+  ungroup() %>% group_by(sales_customer) %>% add_tally(name="total") %>% ungroup() %>%
+  group_by(sales_customer, short_storage) %>% add_count(short_storage) %>% 
+  slice(n()) %>% mutate(p = n/total) %>% ungroup() %>% group_by(sales_customer) %>% slice(n()) %>%
+  mutate(p = if_else(short_storage==0, 1-p, p))
+bycustomer2 <- left_join(bycustomer, storage_p) %>% select(c(1:19, 30))
+
+
+pca_data2 <- prcomp(bycustomer2[-1], scale. = TRUE, center = TRUE)
+fviz_contrib(pca_data2, "var")
+
+wss2 <- numeric(25)
+for(k in 1:25){
+  model2 <- kmeans(pca_data2$x, k, nstart = 25, iter.max = 20)
+  wss2[k] <- sum(model2$withinss)
+}
+plot(1:25, wss2)
+
+final_model2 <- kmeans(pca_data2$x, 4)
+fviz_cluster(final_model2, pca_data2$x)
+#Perhaps there are too many attributes used for pca & clustering
+#Adding the P attribute is likely to be shadowed by the numerous other attributes
+```
+
+### Final Cluster
+```{r}
+#Try with just Visits, Ago, P & Mean
+bycustomer3 <- bycustomer2 %>% select(c(1,2,3,4,20))
+pca_data3 <- prcomp(bycustomer3[-1], scale. = TRUE, center = TRUE)
+
+
+#P and Visits account for more than 50%
+fviz_contrib(pca_data3, "var")
+wss3 <- numeric(25)
+for(k in 1:25){
+  model3 <- kmeans(bycustomer3[-1], k, nstart = 25)
+  wss3[k] <- sum(model3$withinss)
+}
+
+#use k=4, by far the best available elbow-point
+plot(1:25, wss3)
+
+
+final_model3 <- kmeans(pca_data3$x, 4)
+fviz_cluster(final_model3, pca_data3$x)
+
+ggplot(bycustomer3, aes(x=p, y=visits, size = ago)) + 
+  geom_jitter(aes(color = as.factor(final_model3$cluster))) + 
+  theme(legend.position = "bottom") +
+  labs(title="4-Group Clustering",
+       x="Proportion of Short Shelf Life Goods", y="No. of Visits",
+       fill = "Clusterting Groups")
+
+#Group1: Group of customers who bought mostly long-shelf life goods(low x values),
+#       didn't visit the shop very often and whose number of days since last visit vary.
+
+#Group 2: Group of customers who didn't visit the store often(low y values), 
+#         buy a wide range of products(wide x values), and whose most recent visits
+#         were a long time ago
+
+#Group3: (special) Group of customers who visit the store often(high y value), who last 
+#         visted the shop recently(small size) and bought mostly short shelf-life 
+#         products(likely customers who stay close to the store)
+
+#Group4: Similar to Group3, in that they buy similar short shelf-life goods. However, they
+#         visited the store less frequently and a longer time ago.
+
+```
+
+
+## Product Category Association Analysis
+### Arules Algorithm
+```{r}
+library(arules)
+library(arulesViz)
+
+trans_data1 <- left_join(s2_trans, s2_prod, by = c("sales_product"="product_id")) %>% select(c(2,7,8)) %>%
+  mutate(id = as.factor(sales_receipt)) %>%
+  mutate(level1 = as.factor(product_lvl1_cat_desc)) %>%
+  mutate(level2 = as.factor(product_lvl2_cat_desc)) %>% 
+  select(c(4,5))
+write.csv(trans_data1,file="trans_data1.csv", row.names=TRUE) 
+tranx1 <- read.transactions(file="trans_data1.csv",format="single", sep=",", cols=c("id", "level1"),
+                           header = TRUE)
+
+rules1 <- apriori(tranx1, parameter = list(support = 0.01, confidence = 0.8,
+                                              maxlen = 10))
+rules1 <- rules1[!is.redundant(rules1)]
+
+best_rules1 <- head(rules1, n=7, by = "lift")
+plot(best_rules1, method = "graph")
+
+trans_data2 <- left_join(s2_trans, s2_prod, by = c("sales_product"="product_id")) %>% select(c(2,7,8)) %>%
+  mutate(id = as.factor(sales_receipt)) %>%
+  mutate(level1 = as.factor(product_lvl1_cat_desc)) %>%
+  mutate(level2 = as.factor(product_lvl2_cat_desc)) %>% 
+  select(c(4,6))
+
+write.csv(trans_data2,file="trans_data2.csv", row.names=TRUE) 
+tranx2 <- read.transactions(file="trans_data2.csv",format="single", sep=",", cols=c("id", "level2"),
+                           header = TRUE)
+
+rules2 <- apriori(tranx2, parameter = list(support = 0.01, confidence = 0.8,
+                                              maxlen = 10))
+rules2 <- rules2[!is.redundant(rules2)]
+
+best_rules2 <- head(rules2, n=7, by = "lift")
+plot(best_rules2, method = "graph")
+```
